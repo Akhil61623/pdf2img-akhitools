@@ -1,290 +1,310 @@
-from flask import Flask, render_template_string, request, send_file, after_this_request
-from pdf2image import convert_from_path
-from werkzeug.utils import secure_filename
-import os, tempfile, zipfile, shutil, re
+import os, io, re, uuid, tempfile, zipfile, shutil
 from threading import Timer
+from flask import Flask, render_template_string, request, send_file, after_this_request, jsonify
+from werkzeug.utils import secure_filename
+import fitz  # PyMuPDF
+from PIL import Image
+import razorpay
+
+# ====== Config ======
+RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "rzp_live_RARsbcBzkpvQL6")
+RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "0NOMVQw0d8JuiPXMb0TycrNO")
+PAID_RATE_PER_PAGE_INR = 1   # उदाहरण: ₹1 प्रति पेज (26+)
+FREE_PAGE_LIMIT = 25
+
+# Razorpay client (only if keys present)
+rz_client = None
+if RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET:
+    rz_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
 app = Flask(__name__)
 
-# Render (Linux) पर poppler-utils PATH में होता है, इसलिए None रखें.
-# लोकल Windows पर चाहें तो अपना Poppler bin path नीचे भरें:
-POPPLER_BIN = None
-# POPPLER_BIN = r"C:\Users\akhil\Downloads\Release-25.07.0-0\poppler-25.07.0\Library\bin"
+# इन-मेमाेरी स्टोरेज: token -> file path, pages, paid?
+SLOTS = {}  # token: {"pdf_path":..., "tmpdir":..., "pages": int, "paid": bool}
 
-# ---------------------- UI (HTML + CSS + JS) ----------------------
-INDEX_HTML = r"""
+# ====== UI (Simple) ======
+INDEX_HTML = """
 <!doctype html>
 <html lang="hi">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Mahamaya Stationery — PDF → Image Converter</title>
+<title>Mahamaya Stationery — PDF → JPG (with Paywall)</title>
 <style>
-  :root{
-    --bg:#0b1220; --fg:#e7eaf1; --muted:#93a2bd; --card:#10182b;
-    --accent:#4f8cff; --accent2:#22c55e; --danger:#ef4444; --stroke:#203054;
-  }
-  *{box-sizing:border-box}
-  body{margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; background:var(--bg); color:var(--fg)}
-  .shell{min-height:100svh; display:grid; place-items:center; padding:24px}
-  .card{width:min(900px,100%); background:linear-gradient(180deg,#0f172a 0,#0b1220 100%);
-        border:1px solid var(--stroke); border-radius:20px; padding:24px; box-shadow:0 10px 40px rgba(0,0,0,.35)}
-  .top{display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap}
-  .brand{display:flex; align-items:center; gap:10px; font-weight:800; letter-spacing:.2px}
-  .badge{font-size:12px; padding:2px 8px; border:1px solid var(--stroke); border-radius:999px; color:var(--muted)}
-  h1{margin:6px 0 8px; font-size:24px}
-  p.muted{color:var(--muted); margin:0 0 18px}
-  .grid{display:grid; grid-template-columns:1fr 1fr; gap:14px}
-  @media (max-width:720px){ .grid{grid-template-columns:1fr} }
-  label{font-size:13px; color:#cdd6ea; margin-bottom:6px; display:block}
-  select,input[type="text"]{
-    width:100%; background:#0d162a; color:var(--fg); border:1px solid var(--stroke);
-    border-radius:12px; padding:10px 12px; outline:none
-  }
-  .drop{border:2px dashed var(--stroke); border-radius:16px; padding:18px; background:#0e1830; text-align:center; transition:.2s}
-  .drop.drag{border-color:var(--accent); background:#112042}
-  .note{font-size:12px; color:var(--muted)}
-  .row{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
-  button.btn{display:inline-flex; align-items:center; gap:8px; padding:10px 14px; border-radius:12px;
-    border:1px solid var(--stroke); background:var(--accent); color:#fff; font-weight:700; cursor:pointer}
-  button.ghost{background:#17233f}
-  button:disabled{opacity:.6; cursor:not-allowed}
-  .spinner{width:18px; height:18px; border:3px solid rgba(255,255,255,.25); border-top-color:white; border-radius:50%; animation:spin 1s linear infinite}
-  @keyframes spin{to{transform:rotate(360deg)}}
-  .alert{margin-top:10px; padding:10px 12px; border-radius:12px; font-weight:600; display:none}
-  .alert.ok{background:rgba(34,197,94,.1); color:var(--accent2); border:1px solid rgba(34,197,94,.25)}
-  .alert.err{background:rgba(239,68,68,.1); color:var(--danger); border:1px solid rgba(239,68,68,.25)}
-  .footer{margin-top:14px; font-size:12px; color:var(--muted)}
+  body{font-family:Segoe UI,Roboto,Arial;background:#0b1220;color:#fff;min-height:100vh;display:grid;place-items:center;margin:0}
+  .card{width:min(780px,95%);background:#10182b;border:1px solid #213357;border-radius:16px;padding:20px 18px}
+  h1{margin:0 0 8px;color:#4f8cff}
+  .muted{color:#b6bfd4;font-size:14px;margin:0 0 16px}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  input,select,button{padding:10px 12px;border-radius:10px;border:1px solid #2a3c63;outline:none}
+  input,select{background:#0d1730;color:#fff}
+  button{background:#4f8cff;color:#fff;border:none;font-weight:700;cursor:pointer}
+  #payWrap{display:none;margin-top:10px;padding:10px;border:1px dashed #345}
+  #result, #err{margin-top:10px}
+  #err{color:#ff7777;font-weight:700}
+  #result{color:#22c55e;font-weight:700}
 </style>
 </head>
 <body>
-<div class="shell">
-  <div class="card">
-    <div class="top">
-      <div class="brand">
-        <div style="width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,#4f8cff, #22c55e)"></div>
-        <div>Mahamaya Stationery</div>
-      </div>
-      <div class="badge">PDF → JPG / PNG</div>
-    </div>
+<div class="card">
+  <h1>PDF → JPG (Free ≤25 pages, Paid for more)</h1>
+  <p class="muted">1–25 पेज फ्री कन्वर्ज़न। 26+ पेज के लिए पेमेंट जरूरी होगा।</p>
 
-    <h1>Mahamaya Stationery — तेज़ और साफ़ PDF → इमेज कन्वर्टर</h1>
-    <p class="muted">अपनी PDF चुनें, क्वालिटी/फॉर्मेट सेट करें, पेज रेंज दें (यदि चाहिए) और एक क्लिक में ZIP फाइल डाउनलोड करें।</p>
-
-    <div id="drop" class="drop" tabindex="0">
-      <strong>Drag & Drop</strong> <span class="note">या क्लिक कर के PDF चुनें</span>
-      <input id="file" type="file" accept="application/pdf" style="display:none" />
-      <div id="chosen" class="note" style="margin-top:8px"></div>
-    </div>
-
-    <div style="height:12px"></div>
-
-    <div class="grid">
-      <div>
-        <label for="dpi">क्वालिटी (DPI)</label>
-        <select id="dpi">
-          <option value="150">150 (तेज़, छोटा)</option>
-          <option value="200">200</option>
-          <option value="300">300 (शार्प, बड़ा)</option>
-        </select>
-      </div>
-      <div>
-        <label for="format">फॉर्मेट</label>
-        <select id="format">
-          <option value="JPEG">JPG</option>
-          <option value="PNG">PNG</option>
-        </select>
-      </div>
-      <div style="grid-column:1/-1">
-        <label for="range">पेज रेंज (उदा. 1-3,5) — खाली छोड़ें = सभी</label>
-        <input id="range" type="text" placeholder="1-3,5" />
-      </div>
-    </div>
-
-    <div style="height:12px"></div>
-
-    <div class="row">
-      <button id="convertBtn" class="btn">
-        <span id="spin" class="spinner" style="display:none"></span>
-        Convert & Download
-      </button>
-      <button id="chooseBtn" class="btn ghost">Choose PDF</button>
-      <div id="status" class="note"></div>
-    </div>
-
-    <div id="ok" class="alert ok">हो गया! डाउनलोड शुरू हो गया।</div>
-    <div id="err" class="alert err">Error</div>
-
-    <div class="footer">टिप: बहुत बड़े PDFs पर 150 DPI या पेज रेंज चुनना तेज़ रहता है।</div>
+  <div class="row">
+    <input type="file" id="pdf" accept="application/pdf"/>
+    <label for="dpi">DPI</label>
+    <select id="dpi">
+      <option value="150" selected>150</option>
+      <option value="200">200</option>
+      <option value="300">300</option>
+    </select>
+    <button id="checkBtn">Check Pages</button>
   </div>
+
+  <div id="info" class="muted" style="margin-top:8px"></div>
+
+  <div id="payWrap">
+    <div class="muted">यह PDF {{FREE_PAGE_LIMIT}} से अधिक पेज की है। भुगतान के बाद कन्वर्ट कर पाएँगे।</div>
+    <div class="row" style="margin-top:6px">
+      <button id="payBtn">Pay & Convert</button>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:10px">
+    <button id="convertFreeBtn" style="display:none">Convert Free & Download</button>
+  </div>
+
+  <div id="result"></div>
+  <div id="err"></div>
 </div>
 
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
 <script>
-const drop = document.getElementById('drop');
-const file = document.getElementById('file');
-const chooseBtn = document.getElementById('chooseBtn');
-const chosen = document.getElementById('chosen');
-const convertBtn = document.getElementById('convertBtn');
-const spin = document.getElementById('spin');
-const statusEl = document.getElementById('status');
-const ok = document.getElementById('ok');
+let token = null;
+let needsPayment = false;
+let orderId = null;
+let amount = 0; // paisa
+let key_id = null;
+
+const pdf = document.getElementById('pdf');
+const dpiEl = document.getElementById('dpi');
+const info = document.getElementById('info');
 const err = document.getElementById('err');
+const result = document.getElementById('result');
+const payWrap = document.getElementById('payWrap');
+const payBtn = document.getElementById('payBtn');
+const checkBtn = document.getElementById('checkBtn');
+const convertFreeBtn = document.getElementById('convertFreeBtn');
 
-let selected = null;
-const MAX_MB = 25; // server पर भी check होगा
+function msg(e, ok=false){ err.textContent=''; result.textContent=''; (ok?result:err).textContent=e; }
 
-function showOK(msg){ ok.textContent=msg; ok.style.display='block'; err.style.display='none'; }
-function showERR(msg){ err.textContent=msg; err.style.display='block'; ok.style.display='none'; }
-function clearAlerts(){ ok.style.display='none'; err.style.display='none'; statusEl.textContent=''; }
-
-drop.addEventListener('click', () => file.click());
-chooseBtn.addEventListener('click', () => file.click());
-
-['dragenter','dragover'].forEach(ev=>{
-  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('drag'); });
-});
-['dragleave','drop'].forEach(ev=>{
-  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('drag'); });
-});
-drop.addEventListener('drop', e=>{
-  e.preventDefault();
-  const f = e.dataTransfer.files?.[0];
-  if (f) setFile(f);
-});
-file.addEventListener('change', ()=>{
-  if (file.files.length) setFile(file.files[0]);
-});
-
-function setFile(f){
-  clearAlerts();
-  if (f.type !== 'application/pdf') return showERR("कृपया PDF फ़ाइल चुनें।");
-  const mb = (f.size/1024/1024);
-  if (mb > MAX_MB) return showERR(`फ़ाइल बहुत बड़ी है (Max ${MAX_MB} MB).`);
-  selected = f;
-  chosen.textContent = `चुनी गई फ़ाइल: ${f.name} · ${mb.toFixed(2)} MB`;
-}
-
-convertBtn.addEventListener('click', async ()=>{
+checkBtn.onclick = async () => {
   try{
-    clearAlerts();
-    if(!selected) return showERR("पहले PDF चुनें।");
-    convertBtn.disabled = true; spin.style.display='inline-block'; statusEl.textContent = "Converting...";
-
+    msg('');
+    if(!pdf.files.length) return msg("कृपया PDF चुनें।");
     const fd = new FormData();
-    fd.append('pdf_file', selected);
-    fd.append('dpi', document.getElementById('dpi').value);
-    fd.append('format', document.getElementById('format').value);
-    fd.append('range', document.getElementById('range').value);
-
-    const res = await fetch('/convert', { method:'POST', body: fd });
-    if(!res.ok){
-      const t = await res.text();
-      throw new Error(t || ('HTTP ' + res.status));
+    fd.append('pdf_file', pdf.files[0]);
+    const res = await fetch('/precheck', { method:'POST', body:fd });
+    const data = await res.json();
+    if(!res.ok) throw new Error(data.error || ('HTTP '+res.status));
+    token = data.token;
+    needsPayment = data.needs_payment;
+    info.textContent = `Pages: ${data.pages}. ${needsPayment ? 'Payment required for full convert.' : 'Free convert available.'}`;
+    if(needsPayment){
+      // Create order
+      const orq = await fetch('/create_order', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ token })
+      });
+      const ord = await orq.json();
+      if(!orq.ok) throw new Error(ord.error || ('HTTP '+orq.status));
+      orderId = ord.order_id;
+      amount = ord.amount;
+      key_id = ord.key_id;
+      payWrap.style.display = 'block';
+      convertFreeBtn.style.display = 'none';
+    }else{
+      payWrap.style.display = 'none';
+      convertFreeBtn.style.display = 'inline-block';
     }
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = 'converted_images.zip';
-    document.body.appendChild(a); a.click(); a.remove();
-    URL.revokeObjectURL(url);
-    showOK('हो गया! डाउनलोड शुरू हो गया।');
-  }catch(e){ showERR(e.message || 'Conversion failed.'); }
-  finally{ convertBtn.disabled=false; spin.style.display='none'; statusEl.textContent=''; }
-});
+  }catch(e){ msg(e.message || e, false); }
+};
+
+payBtn.onclick = async () => {
+  if(!orderId || !key_id) return msg("Order not ready.");
+  const options = {
+    key: key_id,
+    amount: amount,
+    currency: "INR",
+    name: "Mahamaya Stationery",
+    description: "PDF > JPG (26+ pages)",
+    order_id: orderId,
+    handler: async function (response) {
+      try{
+        const vr = await fetch('/verify_payment', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({
+            order_id: response.razorpay_order_id,
+            payment_id: response.razorpay_payment_id,
+            signature: response.razorpay_signature,
+            token
+          })
+        });
+        const data = await vr.json();
+        if(!vr.ok) throw new Error(data.error || ('HTTP '+vr.status));
+        // Payment verified → trigger download
+        const url = '/convert_paid?token=' + encodeURIComponent(token) + '&dpi=' + encodeURIComponent(dpiEl.value);
+        window.location = url;
+        msg('Payment verified. Download starting…', true);
+      }catch(e){ msg(e.message || e, false); }
+    },
+    theme: { color: "#4f8cff" }
+  };
+  const rzp = new Razorpay(options);
+  rzp.open();
+};
+
+convertFreeBtn.onclick = () => {
+  if(!token) return msg("Token missing. पहले Check Pages करें।");
+  const url = '/convert_free?token=' + encodeURIComponent(token) + '&dpi=' + encodeURIComponent(dpiEl.value);
+  window.location = url;
+};
 </script>
 </body>
 </html>
-"""
+""".replace("{{FREE_PAGE_LIMIT}}", str(FREE_PAGE_LIMIT))
 
-# ---------------------- Helpers ----------------------
-def parse_range(range_text: str, total_pages: int):
-    if not range_text:
-        return list(range(1, total_pages + 1))
-    pages = set()
-    tokens = re.split(r"\s*,\s*", range_text.strip())
-    for t in tokens:
-        if not t: continue
-        if "-" in t:
-            a, b = t.split("-", 1)
-            if a.isdigit() and b.isdigit():
-                start, end = int(a), int(b)
-                if 1 <= start <= total_pages and start <= end:
-                    for p in range(start, min(end, total_pages) + 1):
-                        pages.add(p)
-        elif t.isdigit():
-            p = int(t)
-            if 1 <= p <= total_pages: pages.add(p)
-    return sorted(pages) if pages else list(range(1, total_pages + 1))
+# ====== Helpers ======
+def count_pages(pdf_path: str) -> int:
+    with fitz.open(pdf_path) as doc:
+        return len(doc)
 
-# ---------------------- Routes ----------------------
+def render_pages_to_zip(pdf_path: str, dpi: int, pages: list[int], out_zip: str):
+    with fitz.open(pdf_path) as doc, zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+        for pno in pages:
+            page = doc[pno-1]
+            mat = fitz.Matrix(dpi/72, dpi/72)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            # save to temp and zip
+            tmp_img = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+            tmp_img.close()
+            pix.save(tmp_img.name)
+            zf.write(tmp_img.name, f"page_{pno}.jpg")
+            os.unlink(tmp_img.name)
+
+# ====== Routes ======
 @app.route("/")
 def home():
-    # सुंदर UI
     return render_template_string(INDEX_HTML)
 
 @app.route("/healthz")
 def health():
-    return "OK: Mahamaya Stationery server is running ✅"
+    return "OK"
 
-@app.route("/convert", methods=["POST"])
-def convert():
+@app.route("/precheck", methods=["POST"])
+def precheck():
     pdf = request.files.get("pdf_file")
     if not pdf:
-        return ("No file uploaded", 400)
+        return jsonify({"error":"no file"}), 400
+    tmpdir = tempfile.mkdtemp(prefix="slot_")
+    fname = secure_filename(pdf.filename) or "input.pdf"
+    pdf_path = os.path.join(tmpdir, fname)
+    pdf.save(pdf_path)
+    pages = count_pages(pdf_path)
+    token = uuid.uuid4().hex
+    SLOTS[token] = {"pdf_path": pdf_path, "tmpdir": tmpdir, "pages": pages, "paid": False}
+    needs_payment = pages > FREE_PAGE_LIMIT
+    return jsonify({"token": token, "pages": pages, "needs_payment": needs_payment})
 
-    # सर्वर-साइड 25MB लिमिट (UI में भी 25MB set है)
+@app.route("/create_order", methods=["POST"])
+def create_order():
+    if rz_client is None:
+        return jsonify({"error":"Razorpay not configured"}), 500
+    data = request.get_json(silent=True) or {}
+    token = data.get("token")
+    slot = SLOTS.get(token)
+    if not slot:
+        return jsonify({"error":"invalid token"}), 400
+    pages = slot["pages"]
+    extra_pages = max(0, pages - FREE_PAGE_LIMIT)
+    amount_in_paisa = max(200, extra_pages * PAID_RATE_PER_PAGE_INR * 100)  # min ₹2.00 example
+    order = rz_client.order.create({
+        "amount": amount_in_paisa,
+        "currency": "INR",
+        "receipt": f"rcpt_{token[:10]}",
+        "payment_capture": 1
+    })
+    slot["order_id"] = order["id"]
+    slot["amount"] = amount_in_paisa
+    return jsonify({"order_id": order["id"], "amount": amount_in_paisa, "key_id": RAZORPAY_KEY_ID})
+
+@app.route("/verify_payment", methods=["POST"])
+def verify_payment():
+    if rz_client is None:
+        return jsonify({"error":"Razorpay not configured"}), 500
+    data = request.get_json(silent=True) or {}
+    order_id = data.get("order_id")
+    payment_id = data.get("payment_id")
+    signature = data.get("signature")
+    token = data.get("token")
+    slot = SLOTS.get(token)
+    if not slot or slot.get("order_id") != order_id:
+        return jsonify({"error":"invalid token/order"}), 400
     try:
-        pdf.stream.seek(0, os.SEEK_END)
-        size = pdf.stream.tell()
-        pdf.stream.seek(0)
-    except Exception:
-        size = 0
-    if size and size > 25 * 1024 * 1024:
-        return ("File too large (max 25 MB).", 400)
+        rz_client.utility.verify_payment_signature({
+            "razorpay_order_id": order_id,
+            "razorpay_payment_id": payment_id,
+            "razorpay_signature": signature
+        })
+        slot["paid"] = True
+        return jsonify({"status":"ok"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
-    dpi = int(request.form.get("dpi", "150"))
-    fmt = request.form.get("format", "JPEG").upper()
-    rng = request.form.get("range", "").strip()
-
-    tmp = tempfile.mkdtemp(prefix="pdf2img_")
+def _finalize_and_send(token: str, dpi: int, free: bool):
+    slot = SLOTS.get(token)
+    if not slot: return ("invalid token", 400)
+    pages = slot["pages"]
+    pdf_path = slot["pdf_path"]
+    tmpdir = slot["tmpdir"]
     try:
-        fname = secure_filename(pdf.filename) or "input.pdf"
-        pdf_path = os.path.join(tmp, fname)
-        pdf.save(pdf_path)
+        if free and pages > FREE_PAGE_LIMIT:
+            return ("free limit exceeded", 403)
+        if (not free) and not slot.get("paid"):
+            return ("payment required", 402)
 
-        kwargs = {"dpi": dpi}
-        if POPPLER_BIN:
-            kwargs["poppler_path"] = POPPLER_BIN
-
-        images_all = convert_from_path(pdf_path, **kwargs)
-        total = len(images_all)
-        pages_to_keep = parse_range(rng, total)
-
-        # चुने हुए पेज ही रखें
-        images = [images_all[i - 1] for i in pages_to_keep]
-
-        # ZIP बनाएं
-        zip_path = os.path.join(tmp, "converted_images.zip")
-        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for i, img in enumerate(images, 1):
-                ext = "jpg" if fmt == "JPEG" else "png"
-                out_name = f"page_{i}.{ext}"
-                out_path = os.path.join(tmp, out_name)
-                img.save(out_path, fmt)
-                zf.write(out_path, out_name)
+        page_list = list(range(1, pages+1)) if not free else list(range(1, min(pages, FREE_PAGE_LIMIT)+1))
+        zip_path = os.path.join(tmpdir, "images.zip")
+        render_pages_to_zip(pdf_path, dpi, page_list, zip_path)
 
         @after_this_request
         def cleanup(response):
-            Timer(5.0, shutil.rmtree, args=[tmp], kwargs={"ignore_errors": True}).start()
+            # clean slot a bit later
+            def _rm():
+                try: shutil.rmtree(tmpdir, ignore_errors=True)
+                except: pass
+                SLOTS.pop(token, None)
+            Timer(10.0, _rm).start()
             return response
 
         return send_file(zip_path, as_attachment=True, download_name="converted_images.zip")
-
     except Exception as e:
-        Timer(1.0, shutil.rmtree, args=[tmp], kwargs={"ignore_errors": True}).start()
         return (f"Error: {e}", 500)
 
+@app.route("/convert_free")
+def convert_free():
+    token = request.args.get("token","")
+    dpi = int(request.args.get("dpi","150"))
+    return _finalize_and_send(token, dpi, free=True)
+
+@app.route("/convert_paid")
+def convert_paid():
+    token = request.args.get("token","")
+    dpi = int(request.args.get("dpi","150"))
+    return _finalize_and_send(token, dpi, free=False)
+
 if __name__ == "__main__":
-    # लोकल टेस्ट: python app.py
     port = int(os.environ.get("PORT", 5000))
     app.run(debug=False, host="0.0.0.0", port=port)
