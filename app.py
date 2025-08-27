@@ -18,7 +18,7 @@ INDEX_HTML = r"""
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Akhi PDF → Image Converter</title>
+<title>Mahamaya Stationery — PDF → Image Converter</title>
 <style>
   :root{
     --bg:#0b1220; --fg:#e7eaf1; --muted:#93a2bd; --card:#10182b;
@@ -63,12 +63,12 @@ INDEX_HTML = r"""
     <div class="top">
       <div class="brand">
         <div style="width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,#4f8cff, #22c55e)"></div>
-        <div>Akhi Tools</div>
+        <div>Mahamaya Stationery</div>
       </div>
       <div class="badge">PDF → JPG / PNG</div>
     </div>
 
-    <h1>तेज़ और साफ़ PDF → इमेज कन्वर्टर</h1>
+    <h1>Mahamaya Stationery — तेज़ और साफ़ PDF → इमेज कन्वर्टर</h1>
     <p class="muted">अपनी PDF चुनें, क्वालिटी/फॉर्मेट सेट करें, पेज रेंज दें (यदि चाहिए) और एक क्लिक में ZIP फाइल डाउनलोड करें।</p>
 
     <div id="drop" class="drop" tabindex="0">
@@ -224,7 +224,7 @@ def home():
 
 @app.route("/healthz")
 def health():
-    return "OK: Akhi server is running ✅"
+    return "OK: Mahamaya Stationery server is running ✅"
 
 @app.route("/convert", methods=["POST"])
 def convert():
