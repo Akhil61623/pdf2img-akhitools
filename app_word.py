@@ -6,7 +6,7 @@ from threading import Timer
 
 app = Flask(__name__)
 
-# ---------------------- UI ----------------------
+# ---------------- UI ----------------
 INDEX_HTML = r"""
 <!doctype html>
 <html lang="hi">
@@ -15,20 +15,19 @@ INDEX_HTML = r"""
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>Mahamaya Stationery — PDF → Word Converter</title>
 <style>
-  body{font-family:Segoe UI,Roboto,Arial; margin:0; background:#0b1220; color:#fff; display:flex; justify-content:center; align-items:center; height:100vh}
-  .card{background:#10182b; padding:24px; border-radius:16px; width:400px; text-align:center; box-shadow:0 10px 40px rgba(0,0,0,.35)}
+  body{font-family:Segoe UI,Roboto,Arial; margin:0; background:#0b1220; color:#fff; display:flex; justify-content:center; align-items:center; min-height:100vh}
+  .card{background:#10182b; padding:24px; border-radius:16px; width:min(440px,95%); text-align:center; box-shadow:0 10px 40px rgba(0,0,0,.35)}
   h1{color:#4f8cff; margin-bottom:10px}
-  .muted{color:#aaa; font-size:14px; margin-bottom:20px}
-  input[type=file]{margin:10px 0; padding:8px}
+  .muted{color:#b7c2d3; font-size:14px; margin-bottom:18px}
+  input[type=file]{margin:10px 0; padding:8px; width:100%}
   button{background:#4f8cff; color:#fff; border:none; padding:10px 16px; border-radius:8px; cursor:pointer; font-weight:600}
   button:hover{background:#357ae8}
-  .msg{margin-top:10px; font-size:14px}
 </style>
 </head>
 <body>
   <div class="card">
     <h1>PDF → Word Converter</h1>
-    <p class="muted">अपनी PDF अपलोड करें और Word (DOCX) डाउनलोड करें।</p>
+    <p class="muted">अपनी PDF अपलोड करें और DOCX डाउनलोड करें। (Max ~20MB)</p>
     <form method="POST" action="/convert" enctype="multipart/form-data">
       <input type="file" name="pdf_file" accept="application/pdf" required>
       <br>
@@ -39,6 +38,7 @@ INDEX_HTML = r"""
 </html>
 """
 
+# ---------------- Routes ----------------
 @app.route("/")
 def home():
     return render_template_string(INDEX_HTML)
@@ -60,7 +60,7 @@ def convert():
         pdf.save(pdf_path)
 
         # Output DOCX
-        docx_path = os.path.join(tmp, "output.docx")
+        docx_path = os.path.join(tmp, "converted.docx")
 
         # Convert PDF → Word
         cv = Converter(pdf_path)
@@ -81,4 +81,3 @@ def convert():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(debug=False, host="0.0.0.0", port=port)
-pdf2docx
